@@ -2,12 +2,16 @@ package main
 
 import (
 	"fmt"
+	"io"
+	"io/ioutil"
 	"os"
 	"os/signal"
+	"path"
 	"strings"
 	"syscall"
 
 	"github.com/bwmarrin/discordgo"
+	"github.com/jonas747/dca"
 )
 
 const audioPath = "audio"
@@ -21,11 +25,30 @@ type voiceChannelState struct {
 var userVoiceChannel map[string]voiceChannelState
 var afkChannels map[string]string
 
+var audioAssets map[string]string
+var audioHelp map[string][]string
+
 func main() {
-	// Make Discord session
-	dg, err := discordgo.New("Bot " + "TOKEN GOES HERE")
+	// Read token
+	var tokenBytes, err = ioutil.ReadFile("TOKEN")
 	if err != nil {
-		fmt.Println("Error creating Discord session: ", err)
+		panic(fmt.Sprintf("Error reading token file: %v", err))
+	}
+	var token = string(tokenBytes)
+
+	// Load assets
+	audioAssets, audioHelp = loadAssets(audioPath)
+	for categoryName, categoryContents := range audioHelp {
+		fmt.Printf("%v:\n", categoryName)
+		for _, asset := range categoryContents {
+			fmt.Printf("\t%v\n", asset)
+		}
+	}
+
+	// Make Discord session
+	dg, err := discordgo.New("Bot " + token)
+	if err != nil {
+		panic(fmt.Sprintf("Error creating Discord session: %v", err))
 	}
 
 	// Add event handlers
@@ -52,8 +75,52 @@ func getUniqueUsername(user *discordgo.User) string {
 	return user.Username + "#" + user.Discriminator
 }
 
-func getAssetFromCommand(command string, prefix string) string {
-	return strings.TrimSpace(strings.Replace(command, prefix, "", 1))
+func getAssetFromCommand(command string) string {
+	return strings.Replace(strings.TrimSpace(command), " ", "_", 0)
+}
+
+func getCommandFromMessage(message string) (string, string) {
+	var parts = strings.SplitN(message, " ", 2)
+	if len(parts) == 1 {
+		return parts[0], ""
+	}
+	return parts[0], getAssetFromCommand(parts[1])
+}
+
+func getNormalizedAssetName(assetPath string) string {
+	return strings.TrimSuffix(assetPath, path.Ext(assetPath))
+}
+
+func loadAssets(assetPath string) (map[string]string, map[string][]string) {
+	var assetMap = make(map[string]string)
+	var helpMap = make(map[string][]string)
+
+	assetDir, err := ioutil.ReadDir(assetPath)
+	if err != nil {
+		panic(fmt.Sprintf("Error reading categories from %v: %v", assetPath, err))
+	}
+
+	for _, category := range assetDir {
+		if category.IsDir() {
+			var categoryName = category.Name()
+
+			var categoryPath = path.Join(audioPath, category.Name())
+			categoryDir, err := ioutil.ReadDir(categoryPath)
+			if err != nil {
+				panic(fmt.Sprintf("Error reading assets from %v: %v", categoryPath, err))
+			}
+			helpMap[categoryName] = make([]string, 0)
+			for _, asset := range categoryDir {
+				if !asset.IsDir() {
+					var assetFileName = asset.Name()
+					var assetName = getNormalizedAssetName(assetFileName)
+					assetMap[assetName] = path.Join(categoryPath, assetFileName)
+					helpMap[categoryName] = append(helpMap[categoryName], assetName)
+				}
+			}
+		}
+	}
+	return assetMap, helpMap
 }
 
 func onReady(session *discordgo.Session, event *discordgo.Ready) {
@@ -62,20 +129,94 @@ func onReady(session *discordgo.Session, event *discordgo.Ready) {
 	populateInitialVoiceState(session)
 }
 
+func sendHelp(session *discordgo.Session, targetUser *discordgo.User, helpMap map[string][]string, category string) {
+	var username = getUniqueUsername(targetUser)
+	var dmChannel, err = session.UserChannelCreate(targetUser.ID)
+	if err != nil {
+		panic(fmt.Sprintf("Error creating DM channel to %v: %v", username, err))
+	}
+
+	var messageContent = ""
+	if category == "" {
+		// List categories
+		for key := range helpMap {
+			messageContent += key + "\n"
+		}
+	} else {
+		// List assets in category
+		var categoryContents, categoryFound = helpMap[category]
+		if !categoryFound {
+			panic(fmt.Sprintf("Can't get help for category %v", category))
+		}
+		for _, asset := range categoryContents {
+			messageContent += asset + "\n"
+		}
+	}
+	_, err = session.ChannelMessageSend(dmChannel.ID, messageContent)
+	if err != nil {
+		panic(fmt.Sprintf("Error sending help to %v: %v", username, err))
+	}
+}
+
+func playSound(session *discordgo.Session, assetPath string, authorVoiceState voiceChannelState) {
+	encodeSession, err := dca.EncodeFile(assetPath, dca.StdEncodeOptions)
+	if err != nil {
+		panic(fmt.Sprintf("Failed to encode: %v", err))
+	}
+	defer encodeSession.Cleanup()
+
+	voiceConnection, err := session.ChannelVoiceJoin(
+		authorVoiceState.guild,
+		authorVoiceState.channel,
+		false,
+		false)
+	if err != nil {
+		panic(fmt.Sprintf("Failed to join voice: %v", err))
+	}
+	defer func() {
+		err = voiceConnection.Disconnect()
+		if err != nil {
+			panic(fmt.Sprintf("Failed to disconnect from voice: %v", err))
+		}
+	}()
+
+	done := make(chan error)
+	dca.NewStream(encodeSession, voiceConnection, done)
+	err = <-done
+	if err != nil && err != io.EOF {
+		panic(fmt.Sprintf("Streaming encoded audio failed: %v", err))
+	}
+}
+
 func onMessage(session *discordgo.Session, message *discordgo.MessageCreate) {
 	// Ignore ourselves
 	if message.Author.ID == session.State.User.ID {
 		return
 	}
 
-	if strings.HasPrefix(message.Content, "!aku") {
-		assetName := getAssetFromCommand(message.Content, "!aku")
-		fmt.Printf("[command-audio] %s: %s\n", getUniqueUsername(message.Author), message.Content)
-		fmt.Printf("[audio-playing] %s\n", assetName)
-	} else if strings.HasPrefix(message.Content, "!akus") {
-		assetName := getAssetFromCommand(message.Content, "!akus")
-		fmt.Printf("[command-sticker] %s: %s\n", getUniqueUsername(message.Author), message.Content)
-		fmt.Printf("[sticker-showing] %s\n", assetName)
+	var command, argument = getCommandFromMessage(message.Content)
+	var authorUsername = getUniqueUsername(message.Author)
+	fmt.Printf("[%s] %s: %s\n", command, authorUsername, argument)
+
+	defer func() {
+		var r = recover()
+		if r != nil {
+			fmt.Printf("[%v]: %v\n", command, r)
+		}
+	}()
+
+	switch command {
+	case "!aku":
+		// Validate we can send
+		var authorVoiceState, authorVoiceStateFound = userVoiceChannel[authorUsername]
+		var assetPath, assetExists = audioAssets[argument]
+		if !authorVoiceStateFound || authorVoiceState.channel == "" || !assetExists || message.GuildID != authorVoiceState.guild {
+			return
+		}
+		playSound(session, assetPath, authorVoiceState)
+
+	case "!akuh":
+		sendHelp(session, message.Author, audioHelp, argument)
 	}
 }
 
