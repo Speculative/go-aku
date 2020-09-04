@@ -9,11 +9,13 @@ import (
 	"path"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/jonas747/dca"
 )
 
+const convertedSoundCachePath = "/tmp/aku"
 const audioPath = "audio"
 const stickerPath = "stickers"
 
@@ -45,6 +47,8 @@ func main() {
 		}
 	}
 
+	initializeConvertedSoundCache(getAssetPathsForCategory(audioAssets, audioHelp["entries"]))
+
 	// Make Discord session
 	dg, err := discordgo.New("Bot " + token)
 	if err != nil {
@@ -60,7 +64,7 @@ func main() {
 	err = dg.Open()
 	defer dg.Close()
 	if err != nil {
-		fmt.Println("Error opening Discord session: ", err)
+		panic(fmt.Sprintf("Error opening Discord session: %v", err))
 	}
 
 	// Wait until ctrl+c
@@ -104,7 +108,7 @@ func loadAssets(assetPath string) (map[string]string, map[string][]string) {
 		if category.IsDir() {
 			var categoryName = category.Name()
 
-			var categoryPath = path.Join(audioPath, category.Name())
+			var categoryPath = path.Join(assetPath, category.Name())
 			categoryDir, err := ioutil.ReadDir(categoryPath)
 			if err != nil {
 				panic(fmt.Sprintf("Error reading assets from %v: %v", categoryPath, err))
@@ -121,6 +125,58 @@ func loadAssets(assetPath string) (map[string]string, map[string][]string) {
 		}
 	}
 	return assetMap, helpMap
+}
+
+func getAssetPathsForCategory(assetPaths map[string]string, categoryAssets []string) map[string]string {
+	var targetAssetPaths = make(map[string]string)
+	for _, assetName := range categoryAssets {
+		targetAssetPaths[assetName] = assetPaths[assetName]
+	}
+	return targetAssetPaths
+}
+
+func initializeConvertedSoundCache(initialSounds map[string]string) {
+	var cacheDir, err = os.Stat(convertedSoundCachePath)
+	if os.IsNotExist(err) {
+		err = os.MkdirAll(convertedSoundCachePath, 0700)
+		if err != nil {
+			panic(fmt.Sprintf("Failed to create sound cache directory: %v", err))
+		}
+	} else if !cacheDir.IsDir() {
+		panic(fmt.Sprintf("Sound cache directory %v is a file", convertedSoundCachePath))
+	}
+
+	for soundName, soundPath := range initialSounds {
+		convertAndCache(soundName, soundPath)
+	}
+}
+
+func convertAndCache(soundName string, originalSoundPath string) {
+	encodeSession, err := dca.EncodeFile(originalSoundPath, dca.StdEncodeOptions)
+	defer encodeSession.Cleanup()
+
+	var encodedPath = getConvertedSoundCachePath(soundName)
+	output, err := os.Create(encodedPath)
+	if err != nil {
+		panic(fmt.Sprintf("Failed to cache sound %v: %v", soundName, err))
+	}
+
+	io.Copy(output, encodeSession)
+}
+
+func getConvertedSoundCachePath(soundName string) string {
+	return path.Join(convertedSoundCachePath, fmt.Sprintf("%s.dca", soundName))
+}
+
+func isSoundCached(soundName string) bool {
+	var convertedSoundPath = getConvertedSoundCachePath(soundName)
+	var _, err = os.Stat(convertedSoundPath)
+	if os.IsNotExist(err) {
+		return false
+	} else if err != nil {
+		panic(fmt.Sprintf("Error looking up converted sound at %v: %v", convertedSoundPath, err))
+	}
+	return true
 }
 
 func onReady(session *discordgo.Session, event *discordgo.Ready) {
@@ -158,12 +214,23 @@ func sendHelp(session *discordgo.Session, targetUser *discordgo.User, helpMap ma
 	}
 }
 
-func playSound(session *discordgo.Session, assetPath string, authorVoiceState voiceChannelState) {
-	encodeSession, err := dca.EncodeFile(assetPath, dca.StdEncodeOptions)
+func playSound(session *discordgo.Session, soundName string, soundPath string, authorVoiceState voiceChannelState) {
+	startTime := time.Now()
+	if !isSoundCached(soundName) {
+		convertAndCache(soundName, soundPath)
+	}
+
+	var convertedSoundPath = getConvertedSoundCachePath(soundName)
+	assetFile, err := os.Open(convertedSoundPath)
+	defer assetFile.Close()
+	if err != nil {
+		panic(fmt.Sprintf("Failed to open cached converted sound %v: %v", convertedSoundPath, err))
+	}
+
+	decoder := dca.NewDecoder(assetFile)
 	if err != nil {
 		panic(fmt.Sprintf("Failed to encode: %v", err))
 	}
-	defer encodeSession.Cleanup()
 
 	voiceConnection, err := session.ChannelVoiceJoin(
 		authorVoiceState.guild,
@@ -181,11 +248,13 @@ func playSound(session *discordgo.Session, assetPath string, authorVoiceState vo
 	}()
 
 	done := make(chan error)
-	dca.NewStream(encodeSession, voiceConnection, done)
+	dca.NewStream(decoder, voiceConnection, done)
 	err = <-done
 	if err != nil && err != io.EOF {
-		panic(fmt.Sprintf("Streaming encoded audio failed: %v", err))
+		panic(fmt.Sprintf("Streaming decoded sound failed: %v", err))
 	}
+	duration := time.Since(startTime)
+	fmt.Printf("E2E time %v\n", duration)
 }
 
 func onMessage(session *discordgo.Session, message *discordgo.MessageCreate) {
@@ -213,7 +282,7 @@ func onMessage(session *discordgo.Session, message *discordgo.MessageCreate) {
 		if !authorVoiceStateFound || authorVoiceState.channel == "" || !assetExists || message.GuildID != authorVoiceState.guild {
 			return
 		}
-		playSound(session, assetPath, authorVoiceState)
+		playSound(session, argument, assetPath, authorVoiceState)
 
 	case "!akuh":
 		sendHelp(session, message.Author, audioHelp, argument)
