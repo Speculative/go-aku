@@ -34,6 +34,7 @@ var afkChannels map[string]string
 
 var audioAssets map[string]string
 var audioHelp map[string][]string
+var audioBusy bool
 
 func main() {
 	// Set up logging
@@ -42,11 +43,11 @@ func main() {
 		fmt.Printf("Failed to create log file: %v", err)
 		os.Exit(1)
 	}
-	fileWriter := zerolog.New(logFile)
 	consoleWriter := zerolog.ConsoleWriter{Out: os.Stdout}
-	multiWriter := zerolog.MultiLevelWriter(consoleWriter, fileWriter)
+	multiWriter := zerolog.MultiLevelWriter(consoleWriter, logFile)
 
-	log.Logger = log.Output(multiWriter).With().Timestamp().Logger()
+	log.Logger = zerolog.New(multiWriter).With().Timestamp().Logger()
+	zerolog.SetGlobalLevel(zerolog.InfoLevel)
 
 	// Read token
 	tokenBytes, err := ioutil.ReadFile("TOKEN")
@@ -58,16 +59,16 @@ func main() {
 	}
 	token := string(tokenBytes)
 
+	// Initialize silly global coordination variable
+	audioBusy = false
+
 	// Load assets
 	audioAssets, audioHelp = loadAssets(audioPath)
-	for categoryName, categoryContents := range audioHelp {
-		for _, asset := range categoryContents {
-			log.Debug().
-				Str("asset", asset).
-				Str("categoryName", categoryName).
-				Msg("Loaded asset")
-		}
-	}
+
+	log.Info().
+		Int("categories", len(audioHelp)).
+		Int("sounds", len(audioAssets)).
+		Msg("Loaded assets")
 
 	initializeConvertedSoundCache(getAssetPathsForCategory(audioAssets, audioHelp["entries"]))
 
@@ -288,6 +289,17 @@ func sendHelp(session *discordgo.Session, targetUser *discordgo.User, helpMap ma
 }
 
 func playSound(session *discordgo.Session, soundName string, soundPath string, authorVoiceState voiceChannelState) {
+	if audioBusy {
+		log.Debug().
+			Msg("Skipping sound because another is being played")
+		return
+	}
+
+	audioBusy = true
+	defer func() {
+		audioBusy = false
+	}()
+
 	startTime := time.Now()
 	if !isSoundCached(soundName) {
 		convertAndCache(soundName, soundPath)
@@ -337,6 +349,11 @@ func playSound(session *discordgo.Session, soundName string, soundPath string, a
 				Str("channel", authorVoiceState.channel).
 				Msg("Failed to disconnect from voice")
 			return
+		} else {
+			log.Info().
+				Str("guild", authorVoiceState.guild).
+				Str("channel", authorVoiceState.channel).
+				Msg("Disconnected from voice")
 		}
 	}()
 
@@ -465,6 +482,11 @@ func populateInitialVoiceState(session *discordgo.Session) {
 }
 
 func onVoiceStateUpdate(session *discordgo.Session, event *discordgo.VoiceStateUpdate) {
+	// Ignore ourselves
+	if event.UserID == session.State.User.ID {
+		return
+	}
+
 	user, err := session.User(event.UserID)
 	if err != nil {
 		log.Debug().
@@ -482,7 +504,8 @@ func onVoiceStateUpdate(session *discordgo.Session, event *discordgo.VoiceStateU
 
 	username := getUniqueUsername(user)
 	previousVoiceChannel := userVoiceChannel[username]
-	userVoiceChannel[username] = voiceChannelState{event.ChannelID, event.GuildID}
+	newVoiceState := voiceChannelState{event.ChannelID, event.GuildID}
+	userVoiceChannel[username] = newVoiceState
 	log.Debug().
 		Str("username", username).
 		Str("channelId", event.ChannelID).
@@ -491,14 +514,26 @@ func onVoiceStateUpdate(session *discordgo.Session, event *discordgo.VoiceStateU
 		Str("previousGuild", previousVoiceChannel.guild).
 		Msg("Voice state change")
 
-	if previousVoiceChannel.channel == "" || // Just joined voice
-		(guild.AfkChannelID != "" && previousVoiceChannel.channel == guild.AfkChannelID) || // Came back from AFK
-		(previousVoiceChannel.guild != event.GuildID) { // Came from a different guild
+	entrySoundPath, found := audioAssets[username]
+	if !found {
+		// Don't have an entry sound for this user
+		return
+	}
+
+	if newVoiceState.channel != "" && // Don't try to play sounds when the user leaves voice
+		((previousVoiceChannel.channel == "") || // Just joined voice
+			(guild.AfkChannelID != "" && previousVoiceChannel.channel == guild.AfkChannelID) || // Came back from AFK
+			(previousVoiceChannel.guild != event.GuildID)) { // Came from a different guild
+		fmt.Printf("The weird channel is %v\n", newVoiceState.channel)
 		log.Info().
+			Str("channel", event.ChannelID).
+			Str("guild", event.GuildID).
 			Str("username", username).
 			Msg("Playing entry sound")
-		// TODO: Play the entry sound here
+		playSound(session, username, entrySoundPath, newVoiceState)
 		log.Info().
+			Str("channel", event.ChannelID).
+			Str("guild", event.GuildID).
 			Str("username", username).
 			Msg("Played entry sound")
 	}
