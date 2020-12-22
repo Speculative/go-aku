@@ -2,13 +2,16 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math"
 	"os"
 	"os/signal"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -36,6 +39,20 @@ var audioAssets map[string]string
 var audioHelp map[string][]string
 var audioBusy bool
 
+const resultsPerPage = 10
+const previousPageEmoji = "⬅️"
+const nextPageEmoji = "➡️"
+
+var paginationReactions = []string{previousPageEmoji, nextPageEmoji}
+
+type helpPage struct {
+	index    *map[string][]string
+	category string
+	page     int
+}
+
+var activeHelpPages map[string]helpPage
+
 func main() {
 	// Set up logging
 	logFile, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0644)
@@ -59,8 +76,9 @@ func main() {
 	}
 	token := string(tokenBytes)
 
-	// Initialize silly global coordination variable
+	// Initialize silly global state
 	audioBusy = false
+	activeHelpPages = make(map[string]helpPage)
 
 	// Load assets
 	audioAssets, audioHelp = loadAssets(audioPath)
@@ -85,6 +103,7 @@ func main() {
 	dg.AddHandler(onReady)
 	dg.AddHandler(onMessage)
 	dg.AddHandler(onVoiceStateUpdate)
+	dg.AddHandler(onMessageReactionAdd)
 
 	// Connect
 	err = dg.Open()
@@ -248,44 +267,128 @@ func onReady(session *discordgo.Session, event *discordgo.Ready) {
 	populateInitialVoiceState(session)
 }
 
-func sendHelp(session *discordgo.Session, targetUser *discordgo.User, helpMap map[string][]string, category string) {
-	var username = getUniqueUsername(targetUser)
-	var dmChannel, err = session.UserChannelCreate(targetUser.ID)
+func renderHelpPage(helpPage helpPage) (discordgo.MessageEmbed, error) {
+	messageContent := ""
+	var categoryContents []string
+	if helpPage.category == "" {
+		// List categories
+		categoryContents = make([]string, 0, len(*helpPage.index))
+		for category := range *helpPage.index {
+			categoryContents = append(categoryContents, category)
+		}
+		sort.Strings(categoryContents)
+	} else {
+		// List assets in category
+		assets, categoryFound := (*helpPage.index)[helpPage.category]
+		if !categoryFound {
+			log.Info().
+				Str("category", helpPage.category).
+				Msg("Non-existent category")
+			return discordgo.MessageEmbed{}, errors.New("No such category")
+		}
+		sort.Strings(assets)
+		categoryContents = assets
+	}
+
+	pageStart := helpPage.page * resultsPerPage
+	pageEnd := (helpPage.page + 1) * resultsPerPage
+	if pageEnd > len(categoryContents) {
+		pageEnd = len(categoryContents)
+	}
+	for _, pageEntry := range categoryContents[pageStart:pageEnd] {
+		messageContent += pageEntry + "\n"
+	}
+
+	title := helpPage.category
+	if title == "" {
+		title = "Categories"
+	}
+	footer := discordgo.MessageEmbedFooter{
+		Text: fmt.Sprintf("Page %d/%d\n", helpPage.page+1, totalPages(helpPage.category, &audioHelp)),
+	}
+	return discordgo.MessageEmbed{
+		Title:       title,
+		Description: messageContent,
+		Footer:      &footer,
+	}, nil
+}
+
+func totalPages(category string, helpMap *map[string][]string) int {
+	if category == "" {
+		return int(math.Ceil(float64(len(*helpMap)) / float64(resultsPerPage)))
+	}
+	return int(math.Ceil(float64(len((*helpMap)[category])) / float64(resultsPerPage)))
+}
+
+func initializeReactions(session *discordgo.Session, channelID string, messageID string, targetEmoji []string) {
+	for _, emoji := range targetEmoji {
+		err := session.MessageReactionAdd(channelID, messageID, emoji)
+		if err != nil {
+			log.Error().
+				Err(err).
+				Str("emoji", emoji).
+				Str("channelID", channelID).
+				Str("messageID", messageID).
+				Msg("Error initializing reaction")
+		}
+	}
+}
+
+func resetReactions(session *discordgo.Session, channelID string, messageID string, targetEmoji []string) {
+	for _, emoji := range targetEmoji {
+		// Remove reactions that aren't from the bot
+		reactingUsers, err := session.MessageReactions(channelID, messageID, emoji, 100, "", "")
+		if err != nil {
+			log.Error().
+				Err(err).
+				Str("emoji", emoji).
+				Str("channelID", channelID).
+				Str("messageID", messageID).
+				Msg("Error getting reactions")
+		} else {
+			for _, reactingUser := range reactingUsers {
+				if reactingUser.ID != session.State.User.ID {
+					err := session.MessageReactionRemove(channelID, messageID, emoji, reactingUser.ID)
+					if err != nil {
+						log.Error().
+							Err(err).
+							Str("emoji", emoji).
+							Str("channelID", channelID).
+							Str("messageID", messageID).
+							Msg("Error removing reaction")
+					}
+				}
+			}
+		}
+	}
+}
+
+func sendHelp(session *discordgo.Session, channelID string, index *map[string][]string, category string) {
+	helpPage := helpPage{
+		index:    index,
+		category: category,
+		page:     0,
+	}
+	messageContent, err := renderHelpPage(helpPage)
 	if err != nil {
-		log.Error().
+		log.Info().
 			Err(err).
-			Str("username", username).
-			Msg("Error creating DM channel")
+			Str("category", category).
+			Msg("Error rendering help page")
 		return
 	}
 
-	var messageContent = ""
-	if category == "" {
-		// List categories
-		for key := range helpMap {
-			messageContent += key + "\n"
-		}
-	} else {
-		// List assets in category
-		var categoryContents, categoryFound = helpMap[category]
-		if !categoryFound {
-			log.Info().
-				Str("category", category).
-				Msg("Non-existent category")
-			return
-		}
-		for _, asset := range categoryContents {
-			messageContent += asset + "\n"
-		}
-	}
-	_, err = session.ChannelMessageSend(dmChannel.ID, messageContent)
+	message, err := session.ChannelMessageSendEmbed(channelID, &messageContent)
 	if err != nil {
 		log.Error().
 			Err(err).
-			Str("username", username).
+			Str("channelID", channelID).
 			Msg("Error sending help")
 		return
 	}
+
+	initializeReactions(session, channelID, message.ID, paginationReactions)
+	activeHelpPages[message.ID] = helpPage
 }
 
 func playSound(session *discordgo.Session, soundName string, soundPath string, authorVoiceState voiceChannelState) {
@@ -395,11 +498,9 @@ func onMessage(session *discordgo.Session, message *discordgo.MessageCreate) {
 
 	var command, argument = getCommandFromMessage(message.Content)
 	var authorUsername = getUniqueUsername(message.Author)
-	log.Info().
-		Str("command", command).
-		Str("argument", argument).
-		Str("authorUsername", authorUsername).
-		Msg("Processing command")
+	if !strings.HasPrefix(command, "!aku") {
+		return
+	}
 
 	defer func() {
 		err := recover()
@@ -410,6 +511,12 @@ func onMessage(session *discordgo.Session, message *discordgo.MessageCreate) {
 			return
 		}
 	}()
+
+	log.Info().
+		Str("command", command).
+		Str("argument", argument).
+		Str("authorUsername", authorUsername).
+		Msg("Processing command")
 
 	switch command {
 	case "!aku":
@@ -425,7 +532,7 @@ func onMessage(session *discordgo.Session, message *discordgo.MessageCreate) {
 		playSound(session, argument, assetPath, authorVoiceState)
 
 	case "!akuh":
-		sendHelp(session, message.Author, audioHelp, argument)
+		sendHelp(session, message.ChannelID, &audioHelp, argument)
 	}
 }
 
@@ -497,7 +604,7 @@ func onVoiceStateUpdate(session *discordgo.Session, event *discordgo.VoiceStateU
 	guild, err := session.Guild(event.GuildID)
 	if err != nil {
 		log.Debug().
-			Str("userId", user.ID).
+			Str("userID", user.ID).
 			Msg("Failed to get guild from voice state update")
 		return
 	}
@@ -508,8 +615,8 @@ func onVoiceStateUpdate(session *discordgo.Session, event *discordgo.VoiceStateU
 	userVoiceChannel[username] = newVoiceState
 	log.Debug().
 		Str("username", username).
-		Str("channelId", event.ChannelID).
-		Str("guildId", event.GuildID).
+		Str("channelID", event.ChannelID).
+		Str("guildID", event.GuildID).
 		Str("previousChannel", previousVoiceChannel.channel).
 		Str("previousGuild", previousVoiceChannel.guild).
 		Msg("Voice state change")
@@ -536,5 +643,53 @@ func onVoiceStateUpdate(session *discordgo.Session, event *discordgo.VoiceStateU
 			Str("guild", event.GuildID).
 			Str("username", username).
 			Msg("Played entry sound")
+	}
+}
+
+func onMessageReactionAdd(session *discordgo.Session, event *discordgo.MessageReactionAdd) {
+	if event.UserID == session.State.User.ID {
+		return
+	}
+
+	// Always remove whatever reactions we got
+	resetReactions(session, event.ChannelID, event.MessageID, paginationReactions)
+
+	helpPage, found := activeHelpPages[event.MessageID]
+	if !found {
+		return
+	}
+
+	log.Info().
+		Str("messageID", event.MessageID).
+		Str("emoji", event.Emoji.Name).
+		Str("category", helpPage.category).
+		Int("page", helpPage.page).
+		Msg("Help page reaction")
+
+	switch event.Emoji.Name {
+	case previousPageEmoji:
+		helpPage.page--
+	case nextPageEmoji:
+		helpPage.page++
+	}
+
+	if helpPage.page < 0 || helpPage.page >= totalPages(helpPage.category, &audioHelp) {
+		// Page out of bounds, ignore
+		return
+	}
+
+	// Track the page
+	activeHelpPages[event.MessageID] = helpPage
+
+	// Update the help message
+
+	newHelpMessage, err := renderHelpPage(helpPage)
+
+	_, err = session.ChannelMessageEditEmbed(event.ChannelID, event.MessageID, &newHelpMessage)
+	if err != nil {
+		log.Info().
+			Err(err).
+			Msg("Error changing help page")
+		return
 	}
 }
