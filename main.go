@@ -435,14 +435,6 @@ func playSound(session *discordgo.Session, soundName string, soundPath string, a
 		authorVoiceState.channel,
 		false,
 		false)
-	if err != nil {
-		log.Error().
-			Err(err).
-			Str("guild", authorVoiceState.guild).
-			Str("channel", authorVoiceState.channel).
-			Msg("Failed to join voice")
-		return
-	}
 	defer func() {
 		err = voiceConnection.Disconnect()
 		if err != nil {
@@ -451,7 +443,6 @@ func playSound(session *discordgo.Session, soundName string, soundPath string, a
 				Str("guild", authorVoiceState.guild).
 				Str("channel", authorVoiceState.channel).
 				Msg("Failed to disconnect from voice")
-			return
 		} else {
 			log.Info().
 				Str("guild", authorVoiceState.guild).
@@ -459,6 +450,14 @@ func playSound(session *discordgo.Session, soundName string, soundPath string, a
 				Msg("Disconnected from voice")
 		}
 	}()
+	if err != nil {
+		log.Error().
+			Err(err).
+			Str("guild", authorVoiceState.guild).
+			Str("channel", authorVoiceState.channel).
+			Msg("Failed to join voice")
+		return
+	}
 
 	done := make(chan error)
 	dca.NewStream(decoder, voiceConnection, done)
