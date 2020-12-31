@@ -9,7 +9,6 @@ import (
 	"math"
 	"os"
 	"os/signal"
-	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -39,6 +38,9 @@ var audioAssets map[string]string
 var audioHelp map[string][]string
 var audioBusy bool
 
+var stickerAssets map[string]string
+var stickerHelp map[string][]string
+
 const resultsPerPage = 10
 const previousPageEmoji = "⬅️"
 const nextPageEmoji = "➡️"
@@ -46,9 +48,10 @@ const nextPageEmoji = "➡️"
 var paginationReactions = []string{previousPageEmoji, nextPageEmoji}
 
 type helpPage struct {
-	index    *map[string][]string
-	category string
-	page     int
+	name       string
+	page       int
+	totalPages int
+	renderPage func(int) (discordgo.MessageEmbed, error)
 }
 
 var activeHelpPages map[string]helpPage
@@ -82,12 +85,18 @@ func main() {
 
 	// Load assets
 	audioAssets, audioHelp = loadAssets(audioPath)
-
 	log.Info().
 		Int("categories", len(audioHelp)).
 		Int("sounds", len(audioAssets)).
-		Msg("Loaded assets")
+		Msg("Loaded sounds")
 
+	stickerAssets, stickerHelp = loadAssets(stickerPath)
+	log.Info().
+		Int("categories", len(stickerHelp)).
+		Int("sounds", len(stickerAssets)).
+		Msg("Loaded stickers")
+
+	// Pre-cache entry sounds
 	initializeConvertedSoundCache(getAssetPathsForCategory(audioAssets, audioHelp["entries"]))
 
 	// Make Discord session
@@ -138,7 +147,7 @@ func getCommandFromMessage(message string) (string, string) {
 }
 
 func getNormalizedAssetName(assetPath string) string {
-	return strings.TrimSuffix(assetPath, path.Ext(assetPath))
+	return strings.TrimSuffix(assetPath, filepath.Ext(assetPath))
 }
 
 func loadAssets(assetPath string) (map[string]string, map[string][]string) {
@@ -267,57 +276,62 @@ func onReady(session *discordgo.Session, event *discordgo.Ready) {
 	populateInitialVoiceState(session)
 }
 
-func renderHelpPage(helpPage helpPage) (discordgo.MessageEmbed, error) {
-	messageContent := ""
-	var categoryContents []string
-	if helpPage.category == "" {
-		// List categories
-		categoryContents = make([]string, 0, len(*helpPage.index))
-		for category := range *helpPage.index {
-			categoryContents = append(categoryContents, category)
+func renderPaginatedStrings(title string, allContents []string) func(int) (discordgo.MessageEmbed, error) {
+	return func(page int) (discordgo.MessageEmbed, error) {
+		pageStart := page * resultsPerPage
+		pageEnd := (page + 1) * resultsPerPage
+		if pageEnd > len(allContents) {
+			pageEnd = len(allContents)
 		}
-		sort.Strings(categoryContents)
-	} else {
-		// List assets in category
-		assets, categoryFound := (*helpPage.index)[helpPage.category]
-		if !categoryFound {
-			log.Info().
-				Str("category", helpPage.category).
-				Msg("Non-existent category")
-			return discordgo.MessageEmbed{}, errors.New("No such category")
+
+		messageContent := ""
+		for _, pageEntry := range allContents[pageStart:pageEnd] {
+			messageContent += pageEntry + "\n"
 		}
-		sort.Strings(assets)
-		categoryContents = assets
-	}
 
-	pageStart := helpPage.page * resultsPerPage
-	pageEnd := (helpPage.page + 1) * resultsPerPage
-	if pageEnd > len(categoryContents) {
-		pageEnd = len(categoryContents)
+		footer := discordgo.MessageEmbedFooter{
+			Text: fmt.Sprintf("Page %d/%d\n", page+1, totalPages(allContents)),
+		}
+		return discordgo.MessageEmbed{
+			Title:       title,
+			Description: messageContent,
+			Footer:      &footer,
+		}, nil
 	}
-	for _, pageEntry := range categoryContents[pageStart:pageEnd] {
-		messageContent += pageEntry + "\n"
-	}
+}
 
-	title := helpPage.category
-	if title == "" {
-		title = "Categories"
+func initializeAudioCategoryHelpPage(category string) (helpPage, error) {
+	sounds, categoryFound := audioHelp[category]
+	if !categoryFound {
+		return helpPage{}, errors.New("No such category")
 	}
-	footer := discordgo.MessageEmbedFooter{
-		Text: fmt.Sprintf("Page %d/%d\n", helpPage.page+1, totalPages(helpPage.category, &audioHelp)),
-	}
-	return discordgo.MessageEmbed{
-		Title:       title,
-		Description: messageContent,
-		Footer:      &footer,
+	sort.Strings(sounds)
+
+	return helpPage{
+		name:       "audio/" + category,
+		page:       0,
+		totalPages: totalPages(sounds),
+		renderPage: renderPaginatedStrings(category, sounds),
 	}, nil
 }
 
-func totalPages(category string, helpMap *map[string][]string) int {
-	if category == "" {
-		return int(math.Ceil(float64(len(*helpMap)) / float64(resultsPerPage)))
+func initializeCategoryRootHelpPage(name string, index *map[string][]string) (helpPage, error) {
+	categories := make([]string, 0, len(*index))
+	for category := range *index {
+		categories = append(categories, category)
 	}
-	return int(math.Ceil(float64(len((*helpMap)[category])) / float64(resultsPerPage)))
+	sort.Strings(categories)
+
+	return helpPage{
+		name:       name,
+		page:       0,
+		totalPages: totalPages(categories),
+		renderPage: renderPaginatedStrings("Categories", categories),
+	}, nil
+}
+
+func totalPages(allContents []string) int {
+	return int(math.Ceil(float64(len(allContents)) / float64(resultsPerPage)))
 }
 
 func initializeReactions(session *discordgo.Session, channelID string, messageID string, targetEmoji []string) {
@@ -363,17 +377,12 @@ func resetReactions(session *discordgo.Session, channelID string, messageID stri
 	}
 }
 
-func sendHelp(session *discordgo.Session, channelID string, index *map[string][]string, category string) {
-	helpPage := helpPage{
-		index:    index,
-		category: category,
-		page:     0,
-	}
-	messageContent, err := renderHelpPage(helpPage)
+func sendHelp(session *discordgo.Session, channelID string, helpPage helpPage) {
+	messageContent, err := helpPage.renderPage(helpPage.page)
 	if err != nil {
 		log.Info().
 			Err(err).
-			Str("category", category).
+			Str("name", helpPage.name).
 			Msg("Error rendering help page")
 		return
 	}
@@ -389,6 +398,25 @@ func sendHelp(session *discordgo.Session, channelID string, index *map[string][]
 
 	initializeReactions(session, channelID, message.ID, paginationReactions)
 	activeHelpPages[message.ID] = helpPage
+}
+
+func sendAudioHelp(session *discordgo.Session, channelID string, category string) {
+	var helpPage helpPage
+	var err error
+	if category == "" {
+		helpPage, err = initializeCategoryRootHelpPage("audio", &audioHelp)
+	} else {
+		helpPage, err = initializeAudioCategoryHelpPage(category)
+	}
+	if err != nil {
+		log.Info().
+			Err(err).
+			Str("category", category).
+			Msg("Error initializing audio help page")
+		return
+	}
+
+	sendHelp(session, channelID, helpPage)
 }
 
 func playSound(session *discordgo.Session, soundName string, soundPath string, authorVoiceState voiceChannelState) {
@@ -531,7 +559,14 @@ func onMessage(session *discordgo.Session, message *discordgo.MessageCreate) {
 		playSound(session, argument, assetPath, authorVoiceState)
 
 	case "!akuh":
-		sendHelp(session, message.ChannelID, &audioHelp, argument)
+		sendAudioHelp(session, message.ChannelID, argument)
+
+		// case "!akus":
+		// 	var assetPath, assetExists = stickerAssets[argument]
+		// 	if !assetExists {
+		// 		return
+		// 	}
+		// 	sendSticker(session, message, message.ChannelID, stickerPath)
 	}
 }
 
@@ -630,7 +665,6 @@ func onVoiceStateUpdate(session *discordgo.Session, event *discordgo.VoiceStateU
 		((previousVoiceChannel.channel == "") || // Just joined voice
 			(guild.AfkChannelID != "" && previousVoiceChannel.channel == guild.AfkChannelID) || // Came back from AFK
 			(previousVoiceChannel.guild != event.GuildID)) { // Came from a different guild
-		fmt.Printf("The weird channel is %v\n", newVoiceState.channel)
 		log.Info().
 			Str("channel", event.ChannelID).
 			Str("guild", event.GuildID).
@@ -658,10 +692,9 @@ func onMessageReactionAdd(session *discordgo.Session, event *discordgo.MessageRe
 		return
 	}
 
-	log.Info().
+	log.Debug().
 		Str("messageID", event.MessageID).
 		Str("emoji", event.Emoji.Name).
-		Str("category", helpPage.category).
 		Int("page", helpPage.page).
 		Msg("Help page reaction")
 
@@ -672,7 +705,7 @@ func onMessageReactionAdd(session *discordgo.Session, event *discordgo.MessageRe
 		helpPage.page++
 	}
 
-	if helpPage.page < 0 || helpPage.page >= totalPages(helpPage.category, &audioHelp) {
+	if helpPage.page < 0 || helpPage.page >= helpPage.totalPages {
 		// Page out of bounds, ignore
 		return
 	}
@@ -682,7 +715,7 @@ func onMessageReactionAdd(session *discordgo.Session, event *discordgo.MessageRe
 
 	// Update the help message
 
-	newHelpMessage, err := renderHelpPage(helpPage)
+	newHelpMessage, err := helpPage.renderPage(helpPage.page)
 
 	_, err = session.ChannelMessageEditEmbed(event.ChannelID, event.MessageID, &newHelpMessage)
 	if err != nil {
