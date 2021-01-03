@@ -1,0 +1,6 @@
+# The URL to serve static content from. Trailing slash is important!
+baseURL = "http://shapeshifting.masterofevil.com/"
+# Port to listen on to serve static content. If it isn't 80 your baseURL should include it.
+port = 8050
+# Discord bot token
+token = "ABCDEFGhijklmnopQRSTUVwx.ABC123.AbCdEfGhIjKlMnOpQrStUvWxYz1"

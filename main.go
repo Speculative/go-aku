@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/ioutil"
 	"math"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -17,12 +18,22 @@ import (
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/jonas747/dca"
+	"github.com/pelletier/go-toml"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	"gopkg.in/gographics/imagick.v3/imagick"
 )
 
+type akuConfig struct {
+	BaseURL string
+	Port    int
+	Token   string
+}
+
+const configPath = "config.toml"
 const logPath = "aku.log"
 const convertedSoundCachePath = "/tmp/aku"
+const stickerPageCachePath = "/tmp/akus"
 const audioPath = "audio"
 const stickerPath = "stickers"
 
@@ -31,6 +42,7 @@ type voiceChannelState struct {
 	guild   string
 }
 
+var config akuConfig
 var userVoiceChannel map[string]voiceChannelState
 var afkChannels map[string]string
 
@@ -40,8 +52,15 @@ var audioBusy bool
 
 var stickerAssets map[string]string
 var stickerHelp map[string][]string
+var stickerPackPages map[string][]string
 
-const resultsPerPage = 10
+const stringsPerPage = 10
+
+const stickersPerRow = 4
+const stickerRowsPerPage = 6
+
+var stickersPerPage = stickersPerRow * stickerRowsPerPage
+
 const previousPageEmoji = "⬅️"
 const nextPageEmoji = "➡️"
 
@@ -69,15 +88,17 @@ func main() {
 	log.Logger = zerolog.New(multiWriter).With().Timestamp().Logger()
 	zerolog.SetGlobalLevel(zerolog.InfoLevel)
 
-	// Read token
-	tokenBytes, err := ioutil.ReadFile("TOKEN")
+	// Read config
+	configBytes, err := ioutil.ReadFile(configPath)
 	if err != nil {
 		log.Fatal().
 			Err(err).
-			Msg("Cannot find TOKEN file")
+			Msg("Cannot find config file")
 		os.Exit(1)
 	}
-	token := string(tokenBytes)
+
+	config = akuConfig{}
+	toml.Unmarshal(configBytes, &config)
 
 	// Initialize silly global state
 	audioBusy = false
@@ -98,9 +119,34 @@ func main() {
 
 	// Pre-cache entry sounds
 	initializeConvertedSoundCache(getAssetPathsForCategory(audioAssets, audioHelp["entries"]))
+	defer cleanUpCache(convertedSoundCachePath)
+
+	// Pre-cache sticker pages
+	packNames := getMapKeys(&stickerHelp)
+	initializeStickerPageCache(packNames)
+	defer cleanUpCache(stickerPageCachePath)
+
+	// Static file server for message embeds
+	// Wow this is a dumb idea
+	log.Info().
+		Int("port", config.Port).
+		Str("baseURL", config.BaseURL).
+		Msg("Running http server")
+	fileServer := http.FileServer(http.Dir(stickerPageCachePath))
+	http.Handle("/", fileServer)
+	go func() {
+		err := http.ListenAndServe(fmt.Sprintf(":%d", config.Port), nil)
+		if err != nil {
+			log.Fatal().
+				Err(err).
+				Msg("Static file server stopped")
+			os.Exit(1)
+		}
+	}()
 
 	// Make Discord session
-	dg, err := discordgo.New("Bot " + token)
+	log.Info().Str("token", config.Token).Msg("Using token")
+	dg, err := discordgo.New("Bot " + config.Token)
 	if err != nil {
 		log.Fatal().
 			Err(err).
@@ -199,25 +245,12 @@ func getAssetPathsForCategory(assetPaths map[string]string, categoryAssets []str
 }
 
 func initializeConvertedSoundCache(initialSounds map[string]string) {
-	cacheDir, err := os.Stat(convertedSoundCachePath)
-	if os.IsNotExist(err) {
-		// Create the cache directory if it doesn't exist
-		if err := os.MkdirAll(convertedSoundCachePath, 0700); err != nil {
-			log.Fatal().
-				Err(err).
-				Msg("Failed to create sound cache directory")
-		}
-	} else if err != nil {
+	err := ensureDirectory(convertedSoundCachePath)
+	if err != nil {
 		log.Fatal().
 			Err(err).
-			Str("convertedSoundCachePath", convertedSoundCachePath).
-			Msg("Error statting sound cache directory")
-		return
-	} else if !cacheDir.IsDir() {
-		log.Fatal().
-			Err(err).
-			Str("convertedSoundCachePath", convertedSoundCachePath).
-			Msg("Sound cache directory is a file")
+			Msg("Failed to create sound cache directory")
+
 		return
 	}
 
@@ -231,7 +264,6 @@ func convertAndCache(soundName string, originalSoundPath string) {
 	defer encodeSession.Cleanup()
 
 	var encodedPath = getConvertedSoundCachePath(soundName)
-	// TODO: A leftover cached file could already be present
 	output, err := os.Create(encodedPath)
 	if err != nil {
 		log.Error().
@@ -276,13 +308,18 @@ func onReady(session *discordgo.Session, event *discordgo.Ready) {
 	populateInitialVoiceState(session)
 }
 
+func getPageRange(page int, totalResults int, resultsPerPage int) (int, int) {
+	pageStart := page * resultsPerPage
+	pageEnd := (page + 1) * resultsPerPage
+	if pageEnd > totalResults {
+		pageEnd = totalResults
+	}
+	return pageStart, pageEnd
+}
+
 func renderPaginatedStrings(title string, allContents []string) func(int) (discordgo.MessageEmbed, error) {
 	return func(page int) (discordgo.MessageEmbed, error) {
-		pageStart := page * resultsPerPage
-		pageEnd := (page + 1) * resultsPerPage
-		if pageEnd > len(allContents) {
-			pageEnd = len(allContents)
-		}
+		pageStart, pageEnd := getPageRange(page, len(allContents), stringsPerPage)
 
 		messageContent := ""
 		for _, pageEntry := range allContents[pageStart:pageEnd] {
@@ -290,7 +327,7 @@ func renderPaginatedStrings(title string, allContents []string) func(int) (disco
 		}
 
 		footer := discordgo.MessageEmbedFooter{
-			Text: fmt.Sprintf("Page %d/%d\n", page+1, totalPages(allContents)),
+			Text: fmt.Sprintf("Page %d/%d\n", page+1, totalPages(len(allContents), stringsPerPage)),
 		}
 		return discordgo.MessageEmbed{
 			Title:       title,
@@ -310,28 +347,25 @@ func initializeAudioCategoryHelpPage(category string) (helpPage, error) {
 	return helpPage{
 		name:       "audio/" + category,
 		page:       0,
-		totalPages: totalPages(sounds),
+		totalPages: totalPages(len(sounds), stringsPerPage),
 		renderPage: renderPaginatedStrings(category, sounds),
 	}, nil
 }
 
 func initializeCategoryRootHelpPage(name string, index *map[string][]string) (helpPage, error) {
-	categories := make([]string, 0, len(*index))
-	for category := range *index {
-		categories = append(categories, category)
-	}
+	categories := getMapKeys(index)
 	sort.Strings(categories)
 
 	return helpPage{
 		name:       name,
 		page:       0,
-		totalPages: totalPages(categories),
+		totalPages: totalPages(len(categories), stringsPerPage),
 		renderPage: renderPaginatedStrings("Categories", categories),
 	}, nil
 }
 
-func totalPages(allContents []string) int {
-	return int(math.Ceil(float64(len(allContents)) / float64(resultsPerPage)))
+func totalPages(totalResults int, resultsPerPage int) int {
+	return int(math.Ceil(float64(totalResults) / float64(resultsPerPage)))
 }
 
 func initializeReactions(session *discordgo.Session, channelID string, messageID string, targetEmoji []string) {
@@ -561,12 +595,15 @@ func onMessage(session *discordgo.Session, message *discordgo.MessageCreate) {
 	case "!akuh":
 		sendAudioHelp(session, message.ChannelID, argument)
 
-		// case "!akus":
-		// 	var assetPath, assetExists = stickerAssets[argument]
-		// 	if !assetExists {
-		// 		return
-		// 	}
-		// 	sendSticker(session, message, message.ChannelID, stickerPath)
+	case "!akus":
+		var assetPath, assetExists = stickerAssets[argument]
+		if !assetExists {
+			return
+		}
+		sendSticker(session, message.ChannelID, assetPath)
+
+	case "!akush":
+		sendStickerHelp(session, message.ChannelID, argument)
 	}
 }
 
@@ -714,7 +751,6 @@ func onMessageReactionAdd(session *discordgo.Session, event *discordgo.MessageRe
 	activeHelpPages[event.MessageID] = helpPage
 
 	// Update the help message
-
 	newHelpMessage, err := helpPage.renderPage(helpPage.page)
 
 	_, err = session.ChannelMessageEditEmbed(event.ChannelID, event.MessageID, &newHelpMessage)
@@ -724,4 +760,211 @@ func onMessageReactionAdd(session *discordgo.Session, event *discordgo.MessageRe
 			Msg("Error changing help page")
 		return
 	}
+}
+
+func ensureDirectory(directoryPath string) error {
+	cacheDir, err := os.Stat(directoryPath)
+	if os.IsNotExist(err) {
+		// Create the cache directory if it doesn't exist
+		if err := os.MkdirAll(directoryPath, 0700); err != nil {
+			return errors.New("Failed to create directory")
+		}
+	} else if err != nil {
+		return errors.New("Error statting path")
+	} else if !cacheDir.IsDir() {
+		return errors.New("Directory is a file")
+	}
+	return nil
+}
+
+func cleanUpCache(cachePath string) {
+	err := os.RemoveAll(cachePath)
+	if err != nil {
+		log.Error().
+			Str("cachePath", cachePath).
+			Msg("Failed to remove cache directory")
+	}
+}
+
+func getStickerPageFilename(packName string, page int) string {
+	return fmt.Sprintf("%s-%d.png", packName, page)
+}
+
+func getStickerPagePath(packName string, page int) string {
+	return filepath.Join(stickerPageCachePath, getStickerPageFilename(packName, page))
+}
+
+func getStickerPackPagePermalink(packName string, page int) string {
+	return config.BaseURL + getStickerPageFilename(packName, page)
+}
+
+func initializeStickerPageCache(packNames []string) {
+	stickerPackPages = make(map[string][]string)
+
+	err := ensureDirectory(stickerPageCachePath)
+	if err != nil {
+		log.Fatal().
+			Err(err).
+			Msg("Failed to create sticker page cache directory")
+
+		return
+	}
+
+	for _, packName := range packNames {
+		log.Info().
+			Str("packName", packName).
+			Msg("Creating sticker pack pages")
+		cacheStickerPackPages(packName)
+	}
+}
+
+func cacheStickerPackPages(packName string) {
+	packContents := getDirectoryContents(filepath.Join(stickerPath, packName))
+	totalStickers := len(packContents)
+	packPages := totalPages(totalStickers, stickersPerRow*stickerRowsPerPage)
+
+	stickerPackPages[packName] = make([]string, packPages)
+	for page := 0; page < packPages; page++ {
+		pagePath := getStickerPagePath(packName, page)
+		pageStart, pageEnd := getPageRange(page, totalStickers, stickersPerPage)
+		makeStickerPackPage(packContents[pageStart:pageEnd], pagePath)
+		stickerPackPages[packName][page] = pagePath
+	}
+}
+
+func getDirectoryContents(directory string) []string {
+	files, _ := ioutil.ReadDir(directory)
+	paths := make([]string, 0, len(files))
+	for _, f := range files {
+		name := f.Name()
+		if name != "sources" {
+			paths = append(paths, filepath.Join(directory, name))
+		}
+	}
+	return paths
+}
+
+func makeStickerPackPage(stickerPaths []string, outPath string) {
+	imagick.Initialize()
+	defer imagick.Terminate()
+
+	mw := imagick.NewMagickWand()
+	defer mw.Destroy()
+
+	background := imagick.NewPixelWand()
+	defer background.Destroy()
+	background.SetColor("#ffffff")
+	background.SetAlpha(0.0)
+	mw.SetBackgroundColor(background)
+
+	for _, stickerPath := range stickerPaths {
+		mw.ReadImage(stickerPath)
+	}
+
+	// For each image we loaded
+	mw.ResetIterator()
+	for mw.NextImage() {
+		// Give it a label which is the filename without the extension
+		name := mw.GetImageFilename()
+		label := strings.SplitN(filepath.Base(name), ".", 2)[0]
+		_ = mw.LabelImage(label)
+	}
+
+	dw := imagick.NewDrawingWand()
+	defer dw.Destroy()
+
+	_ = dw.SetFont("./iosevka-aile-bold.ttf")
+	dw.SetFontSize(14)
+
+	montage := mw.MontageImage(
+		dw,
+		fmt.Sprintf("%dx%d+0+0", stickersPerRow, stickerRowsPerPage),
+		"128x128+16+8",
+		imagick.MONTAGE_MODE_UNFRAME,
+		"0x0")
+	_ = montage.BorderImage(background, 32, 16, imagick.COMPOSITE_OP_OVER)
+
+	_ = montage.WriteImage(outPath)
+}
+
+func getMapKeys(index *map[string][]string) []string {
+	// I can't believe golang makes you declare this by yourself
+	// lol no generics
+	keys := make([]string, 0, len(*index))
+	for key := range *index {
+		keys = append(keys, key)
+	}
+	return keys
+}
+
+func sendSticker(session *discordgo.Session, channelID string, stickerPath string) {
+	stickerFile, err := os.Open(stickerPath)
+	defer stickerFile.Close()
+	if err != nil {
+		log.Error().
+			Err(err).
+			Str("stickerPath", stickerPath).
+			Msg("Error opening sticker file")
+		return
+	}
+	session.ChannelFileSend(channelID, filepath.Base(stickerPath), stickerFile)
+}
+
+func initializeStickerHelpPage(packName string) (helpPage, error) {
+	// Currently assumes that all pack pages are generated at startup.
+	// Eventually, (if we had enough stickers) we might want to reduce startup tim
+	// by generating sticker pages on-demand if the check here fails.
+	packPages, found := stickerPackPages[packName]
+	if !found {
+		return helpPage{}, errors.New("Cached sticker pack pages not found")
+	}
+
+	totalPackPages := len(packPages)
+	renderStickerPackPage := func(page int) (discordgo.MessageEmbed, error) {
+		footer := discordgo.MessageEmbedFooter{
+			Text: fmt.Sprintf("Page %d/%d\n", page+1, totalPackPages),
+		}
+		// So the discord API doesn't support multi-image embeds.
+		// Instead we host a damn static file server, use an Image URL embed,
+		// and swap out the URL when the page changes.
+		// What even.
+		permalink := getStickerPackPagePermalink(packName, page)
+		log.Debug().
+			Str("permalink", permalink).
+			Msg("Sending sticker page embed")
+		image := discordgo.MessageEmbedImage{
+			URL: permalink,
+		}
+		return discordgo.MessageEmbed{
+			Title:  packName,
+			Image:  &image,
+			Footer: &footer,
+		}, nil
+	}
+
+	return helpPage{
+		name:       "sticker/" + packName,
+		page:       0,
+		totalPages: totalPackPages,
+		renderPage: renderStickerPackPage,
+	}, nil
+}
+
+func sendStickerHelp(session *discordgo.Session, channelID string, category string) {
+	var helpPage helpPage
+	var err error
+	if category == "" {
+		helpPage, err = initializeCategoryRootHelpPage("sticker", &stickerHelp)
+	} else {
+		helpPage, err = initializeStickerHelpPage(category)
+	}
+	if err != nil {
+		log.Info().
+			Err(err).
+			Str("category", category).
+			Msg("Error initializing sticker help page")
+		return
+	}
+
+	sendHelp(session, channelID, helpPage)
 }
