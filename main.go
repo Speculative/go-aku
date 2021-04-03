@@ -38,9 +38,6 @@ var audioAssets map[string]string
 var audioHelp map[string][]string
 var audioBusy bool
 
-var stickerAssets map[string]string
-var stickerHelp map[string][]string
-
 const resultsPerPage = 10
 const previousPageEmoji = "⬅️"
 const nextPageEmoji = "➡️"
@@ -90,12 +87,6 @@ func main() {
 		Int("sounds", len(audioAssets)).
 		Msg("Loaded sounds")
 
-	stickerAssets, stickerHelp = loadAssets(stickerPath)
-	log.Info().
-		Int("categories", len(stickerHelp)).
-		Int("sounds", len(stickerAssets)).
-		Msg("Loaded stickers")
-
 	// Pre-cache entry sounds
 	initializeConvertedSoundCache(getAssetPathsForCategory(audioAssets, audioHelp["entries"]))
 
@@ -135,7 +126,7 @@ func getUniqueUsername(user *discordgo.User) string {
 }
 
 func getAssetFromCommand(command string) string {
-	return strings.Replace(strings.TrimSpace(command), " ", "_", 0)
+	return strings.Replace(strings.TrimSpace(command), " ", "_", -1)
 }
 
 func getCommandFromMessage(message string) (string, string) {
@@ -560,13 +551,6 @@ func onMessage(session *discordgo.Session, message *discordgo.MessageCreate) {
 
 	case "!akuh":
 		sendAudioHelp(session, message.ChannelID, argument)
-
-		// case "!akus":
-		// 	var assetPath, assetExists = stickerAssets[argument]
-		// 	if !assetExists {
-		// 		return
-		// 	}
-		// 	sendSticker(session, message, message.ChannelID, stickerPath)
 	}
 }
 
