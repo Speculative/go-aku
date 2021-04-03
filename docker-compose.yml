@@ -1,0 +1,14 @@
+services:
+  go-aku:
+    build: .
+    ports:
+      - "8050:8050"
+    volumes:
+      - ./audio:/var/go-aku/audio
+      - ./stickers:/var/go-aku/stickers
+      - logs:/var/log
+  https-proxy:
+    ports:
+      - "443:443"
+volumes:
+  logs: {}

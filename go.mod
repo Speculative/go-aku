@@ -8,5 +8,6 @@ require (
 	github.com/jonas747/ogg v0.0.0-20161220051205-b4f6f4cf3757 // indirect
 	github.com/pelletier/go-toml v1.8.1
 	github.com/rs/zerolog v1.20.0
+	gopkg.in/gographics/imagick.v2 v2.6.0
 	gopkg.in/gographics/imagick.v3 v3.3.0
 )

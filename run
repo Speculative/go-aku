@@ -1,0 +1,1 @@
+docker run --volume /tmp/aku --volume /tmp/akus --mount "type=bind,source=/home/jtao/code/go-aku/aku.log,destination=/var/log/aku.log" --mount "type=bind,source=/home/jtao/code/go-aku/audio,destination=/var/go-aku/audio,readonly" --mount "type=bind,source=/home/jtao/code/go-aku/stickers,destination=/var/go-aku/stickers,readonly" go-aku

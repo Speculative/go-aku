@@ -31,11 +31,11 @@ type akuConfig struct {
 }
 
 const configPath = "config.toml"
-const logPath = "aku.log"
+const logPath = "/var/log/aku.log"
 const convertedSoundCachePath = "/tmp/aku"
 const stickerPageCachePath = "/tmp/akus"
-const audioPath = "audio"
-const stickerPath = "stickers"
+const audioPath = "/var/go-aku/audio"
+const stickerPath = "/var/go-aku/stickers"
 
 type voiceChannelState struct {
 	channel string
