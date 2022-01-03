@@ -21,10 +21,10 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-const logPath = "aku.log"
-const convertedSoundCachePath = "/tmp/aku"
-const audioPath = "audio"
-const stickerPath = "stickers"
+const rootDir = "/go-aku"
+const convertedSoundCachePath = "/go-aku/cache"
+const audioPath = "/go-aku/audio"
+const stickerPath = "/go-aku/stickers"
 
 type voiceChannelState struct {
 	channel string
@@ -54,27 +54,13 @@ type helpPage struct {
 var activeHelpPages map[string]helpPage
 
 func main() {
-	// Set up logging
-	logFile, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		fmt.Printf("Failed to create log file: %v", err)
-		os.Exit(1)
-	}
 	consoleWriter := zerolog.ConsoleWriter{Out: os.Stdout}
-	multiWriter := zerolog.MultiLevelWriter(consoleWriter, logFile)
 
-	log.Logger = zerolog.New(multiWriter).With().Timestamp().Logger()
+	log.Logger = zerolog.New(consoleWriter).With().Timestamp().Logger()
 	zerolog.SetGlobalLevel(zerolog.InfoLevel)
 
-	// Read token
-	tokenBytes, err := ioutil.ReadFile("TOKEN")
-	if err != nil {
-		log.Fatal().
-			Err(err).
-			Msg("Cannot find TOKEN file")
-		os.Exit(1)
-	}
-	token := string(tokenBytes)
+	// Fetch args
+	token := os.Args[1]
 
 	// Initialize silly global state
 	audioBusy = false
@@ -119,6 +105,16 @@ func main() {
 	sc := make(chan os.Signal, 1)
 	signal.Notify(sc, syscall.SIGINT, syscall.SIGTERM, os.Interrupt, os.Kill)
 	<-sc
+
+	// Clean up converted sound cache
+	err = os.RemoveAll(convertedSoundCachePath)
+	if err != nil {
+		log.Fatal().
+			Err(err).
+			Str("convertedSoundCachePath", convertedSoundCachePath).
+			Msg("Failed to clean up converted sound cache")
+		return
+	}
 }
 
 func getUniqueUsername(user *discordgo.User) string {
@@ -210,6 +206,22 @@ func initializeConvertedSoundCache(initialSounds map[string]string) {
 			Str("convertedSoundCachePath", convertedSoundCachePath).
 			Msg("Sound cache directory is a file")
 		return
+	} else {
+		// Converted sound cache left over from last time
+		err := os.RemoveAll(convertedSoundCachePath)
+		if err != nil {
+			log.Fatal().
+				Err(err).
+				Str("convertedSoundCachePath", convertedSoundCachePath).
+				Msg("Failed to delete existing converted sound cache")
+			return
+		}
+
+		if err := os.MkdirAll(convertedSoundCachePath, 0700); err != nil {
+			log.Fatal().
+				Err(err).
+				Msg("Failed to create sound cache directory")
+		}
 	}
 
 	for soundName, soundPath := range initialSounds {
@@ -631,7 +643,7 @@ func onVoiceStateUpdate(session *discordgo.Session, event *discordgo.VoiceStateU
 	previousVoiceChannel := userVoiceChannel[username]
 	newVoiceState := voiceChannelState{event.ChannelID, event.GuildID}
 	userVoiceChannel[username] = newVoiceState
-	log.Debug().
+	log.Info().
 		Str("username", username).
 		Str("channelID", event.ChannelID).
 		Str("guildID", event.GuildID).
@@ -641,6 +653,9 @@ func onVoiceStateUpdate(session *discordgo.Session, event *discordgo.VoiceStateU
 
 	entrySoundPath, found := audioAssets[username]
 	if !found {
+		log.Info().
+			Str("username", username).
+			Msg("Don't have entry sound for user")
 		// Don't have an entry sound for this user
 		return
 	}
