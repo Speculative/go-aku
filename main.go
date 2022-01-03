@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/bwmarrin/discordgo"
+	"github.com/fsnotify/fsnotify"
 	"github.com/jonas747/dca"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -75,6 +76,9 @@ func main() {
 
 	// Pre-cache entry sounds
 	initializeConvertedSoundCache(getAssetPathsForCategory(audioAssets, audioHelp["entries"]))
+
+	// Watch sound directory
+	go watchAssetDir(audioPath, audioAssets, audioHelp)
 
 	// Make Discord session
 	dg, err := discordgo.New("Bot " + token)
@@ -175,6 +179,68 @@ func loadAssets(assetPath string) (map[string]string, map[string][]string) {
 		}
 	}
 	return assetMap, helpMap
+}
+
+func watchDir(dirPath string, onCreate func(string), onRemove func(string)) {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Error().Err(err).Msg("Error starting watcher")
+	}
+	defer watcher.Close()
+
+	done := make(chan bool)
+
+	go func() {
+		for event := range watcher.Events {
+			if event.Op&fsnotify.Create == fsnotify.Create {
+				onCreate(filepath.Base(event.Name))
+			} else if event.Op&fsnotify.Remove == fsnotify.Remove {
+				if event.Name == dirPath {
+					break
+				}
+				onRemove(filepath.Base(event.Name))
+			}
+		}
+		done <- true
+	}()
+
+	err = watcher.Add(dirPath)
+	if err != nil {
+		log.Error().Err(err).Str("dirPath", dirPath).Msg("Failed to watch")
+	}
+
+	<-done
+}
+
+func watchAssetDir(assetPath string, assetMap map[string]string, helpMap map[string][]string) {
+	watchDir(assetPath, func(category string) {
+		categoryPath := filepath.Join(assetPath, category)
+		info, err := os.Stat(categoryPath)
+		if err != nil {
+			log.Error().Err(err).Str("categoryPath", categoryPath).Msg("Error statting category directory")
+		}
+		if info.IsDir() {
+			log.Info().Str("category", category).Msg("Added category")
+
+			helpMap[category] = make([]string, 0)
+			go watchDir(categoryPath, func(assetFile string) {
+				var assetName = getNormalizedAssetName(assetFile)
+				log.Info().Str("assetName", assetName).Msg("Added asset")
+				assetMap[assetName] = filepath.Join(categoryPath, assetFile)
+				helpMap[category] = append(helpMap[category], assetName)
+			}, func(assetFile string) {
+				log.Info().Str("assetFile", assetFile).Msg("Removed asset")
+			})
+		} else {
+			log.Warn().Str("assetPath", assetPath).Str("category", category).Msg("Unexpected file in category directory")
+		}
+	}, func(category string) {
+		log.Info().Str("category", category).Msg("Category removed")
+		_, inHelp := helpMap[category]
+		if inHelp {
+			delete(helpMap, category)
+		}
+	})
 }
 
 func getAssetPathsForCategory(assetPaths map[string]string, categoryAssets []string) map[string]string {
