@@ -60,8 +60,8 @@ func main() {
 	log.Logger = zerolog.New(consoleWriter).With().Timestamp().Logger()
 	zerolog.SetGlobalLevel(zerolog.InfoLevel)
 
-	// Fetch args
-	token := os.Args[1]
+	// Fetch token
+	token := os.Getenv("DISCORD_TOKEN")
 
 	// Initialize silly global state
 	audioBusy = false
