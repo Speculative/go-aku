@@ -16,8 +16,8 @@ import (
 	"time"
 
 	"github.com/bwmarrin/discordgo"
-	"github.com/fsnotify/fsnotify"
 	"github.com/jonas747/dca"
+	"github.com/radovskyb/watcher"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
@@ -182,30 +182,39 @@ func loadAssets(assetPath string) (map[string]string, map[string][]string) {
 }
 
 func watchDir(dirPath string, onCreate func(string), onRemove func(string)) {
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		log.Error().Err(err).Msg("Error starting watcher")
-	}
-	defer watcher.Close()
+	w := watcher.New()
+	w.FilterOps(watcher.Create, watcher.Remove)
 
 	done := make(chan bool)
 
 	go func() {
-		for event := range watcher.Events {
-			if event.Op&fsnotify.Create == fsnotify.Create {
-				onCreate(filepath.Base(event.Name))
-			} else if event.Op&fsnotify.Remove == fsnotify.Remove {
-				if event.Name == dirPath {
-					break
+		for {
+			select {
+			case event := <-w.Event:
+				if event.Op == watcher.Create {
+					log.Info().Str("event.Path", event.Path).Msg("watcher saw file added")
+					onCreate(filepath.Base(event.Path))
+				} else if event.Op == watcher.Remove {
+					if event.Path == dirPath {
+						done <- true
+						return
+					}
+					onRemove(filepath.Base(event.Path))
 				}
-				onRemove(filepath.Base(event.Name))
+			case event := <-w.Error:
+				log.Error().Err(event).Str("dirPath", dirPath).Msg("Error in watch loop")
+			case <-w.Closed:
+				done <- true
+				return
 			}
 		}
-		done <- true
 	}()
 
-	err = watcher.Add(dirPath)
-	if err != nil {
+	if err := w.Add(dirPath); err != nil {
+		log.Error().Err(err).Str("dirPath", dirPath).Msg("Failed to add directory to watcher")
+	}
+
+	if err := w.Start(time.Millisecond * 1000); err != nil {
 		log.Error().Err(err).Str("dirPath", dirPath).Msg("Failed to watch")
 	}
 
